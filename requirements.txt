@@ -1,0 +1,17 @@
+torch>=2.4.1
+torchaudio>=2.4.1
+transformers>=4.45.1
+pandas>=2.2.2
+tqdm>=4.66.5
+numpy>=1.26.4
+scipy>=1.14.1
+librosa>=0.10.2.post1
+soundfile>=0.12.1
+accelerate>=0.34.2
+datasets>=3.0.0
+tokenizers>=0.20.3
+protobuf>=5.29.2
+fsspec>=2024.6.1
+openai-whisper>=20240930
+whisper_normalizer>=0.0.10
+tensorboard>=2.15.0 
