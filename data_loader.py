@@ -150,7 +150,6 @@ class NERData(Dataset):
         return len(self.data)
     
     def _get_resampler(self, orig_sr: int, target_sr: int = 16000):
-        """Get or create a cached resampler"""
         if orig_sr not in self._resampler_cache:
             self._resampler_cache[orig_sr] = torchaudio.transforms.Resample(orig_sr, target_sr)
         return self._resampler_cache[orig_sr]
@@ -161,31 +160,25 @@ class NERData(Dataset):
         text = self.labels[idx]
         label = self.processor.tokenizer(text).input_ids
         
-        # Try to get cached feature first
         cached_feature = self.feature_cache.get(full_path)
         if cached_feature is not None:
             return {'text': text, 'input_features': cached_feature, 'labels': label}
         
-        # Load and preprocess audio
         audio, sample_rate = torchaudio.load(full_path)
         
-        # Handle multi-channel audio: average channels
         if audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
         
-        # Resample if needed (use cached resampler)
         if sample_rate != 16000:
             resampler = self._get_resampler(sample_rate)
             audio = resampler(audio)
         
-        # Squeeze to 1D for feature extractor
         audio = audio.squeeze(0)
         
         feature = self.processor.feature_extractor(
             audio, sampling_rate=16000
         ).input_features[0]
         
-        # Cache the feature for future use
         self.feature_cache.put(full_path, feature)
         
         return {'text': text, 'input_features': feature, 'labels': label}
@@ -231,7 +224,6 @@ class SAData(Dataset):
         return len(self.labels)
     
     def _get_resampler(self, orig_sr: int, target_sr: int = 16000):
-        """Get or create a cached resampler"""
         if orig_sr not in self._resampler_cache:
             self._resampler_cache[orig_sr] = torchaudio.transforms.Resample(orig_sr, target_sr)
         return self._resampler_cache[orig_sr]
@@ -242,31 +234,25 @@ class SAData(Dataset):
         text = self.labels[idx]
         label = self.processor.tokenizer(text).input_ids
         
-        # Try to get cached feature first
         cached_feature = self.feature_cache.get(full_path)
         if cached_feature is not None:
             return {'text': text, 'input_features': cached_feature, 'labels': label}
         
-        # Load and preprocess audio
         audio, sample_rate = torchaudio.load(full_path)
         
-        # Handle multi-channel audio: average channels
         if audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
         
-        # Resample if needed (use cached resampler)
         if sample_rate != 16000:
             resampler = self._get_resampler(sample_rate)
             audio = resampler(audio)
         
-        # Squeeze to 1D for feature extractor
         audio = audio.squeeze(0)
         
         feature = self.processor.feature_extractor(
             audio, sampling_rate=16000
         ).input_features[0]
         
-        # Cache the feature for future use
         self.feature_cache.put(full_path, feature)
         
         return {'text': text, 'input_features': feature, 'labels': label}
@@ -323,7 +309,6 @@ class ChineseNERData(Dataset):
         entities = sample.get('entity', [])
         audio_path = sample['path']
         
-        # Format text
         if self.asr_only:
             text = sentence
         else:
@@ -331,12 +316,10 @@ class ChineseNERData(Dataset):
         
         label = self.processor.tokenizer(text).input_ids
         
-        # Try cached feature
         cached_feature = self.feature_cache.get(audio_path)
         if cached_feature is not None:
             return {'text': text, 'input_features': cached_feature, 'labels': label}
         
-        # Load audio
         audio, sample_rate = torchaudio.load(audio_path)
         
         if audio.size(0) > 1:
@@ -378,7 +361,6 @@ class ChineseSAData(Dataset):
         for _, row in df.iterrows():
             sentiment = row['annotation']
             
-            # Skip invalid sentiments
             if sentiment not in self.VALID_SENTIMENTS:
                 skipped += 1
                 continue
@@ -405,7 +387,6 @@ class ChineseSAData(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # Format text
         if self.asr_only:
             text = sample['text']
         else:
@@ -414,12 +395,10 @@ class ChineseSAData(Dataset):
         label = self.processor.tokenizer(text).input_ids
         audio_path = sample['path']
         
-        # Try cached feature
         cached_feature = self.feature_cache.get(audio_path)
         if cached_feature is not None:
             return {'text': text, 'input_features': cached_feature, 'labels': label}
         
-        # Load audio
         audio, sample_rate = torchaudio.load(audio_path)
         
         if audio.size(0) > 1:
@@ -568,4 +547,4 @@ def load_datasets(config, processor):
     
     logger.info(f"Total - Train: {len(train_dataset)}, Dev: {len(dev_dataset)}")
     
-    return train_dataset, dev_dataset 
+    return train_dataset, dev_dataset

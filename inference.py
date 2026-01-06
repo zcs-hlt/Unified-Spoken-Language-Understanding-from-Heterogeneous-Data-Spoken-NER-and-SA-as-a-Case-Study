@@ -1,15 +1,3 @@
-"""
-UniSLU Inference and Evaluation Script
-
-Features:
-- Supports NER and SA (Sentiment Analysis) tasks
-- Batch inference for maximum speed
-- Custom beam search decoder support
-- Saves inference results to files
-- Computes WER, F1 metrics
-- Performance metrics: throughput, latency, RTF, memory usage
-"""
-
 import os
 import re
 import json
@@ -31,27 +19,20 @@ from sklearn.metrics import classification_report, f1_score, precision_score, re
 from model import DynamicDecodeWhisper
 from utils import get_logger, setup_logging
 
-# Try to import English text normalizer
 try:
     from whisper.normalizers.english import EnglishTextNormalizer
     NORMALIZER = EnglishTextNormalizer()
 except ImportError:
-    logger.warning("EnglishTextNormalizer not available, using simple lowercase normalization")
     NORMALIZER = lambda x: x.lower().strip()
 
 logger = get_logger(__name__)
 
 
-# ============================================================
-# Performance Metrics
-# ============================================================
-
 @dataclass
 class PerformanceMetrics:
-    """Container for inference performance metrics"""
     total_samples: int = 0
-    total_inference_time: float = 0.0  # seconds
-    total_audio_duration: float = 0.0  # seconds
+    total_inference_time: float = 0.0
+    total_audio_duration: float = 0.0
     peak_gpu_memory_mb: float = 0.0
     model_parameters: int = 0
     model_size_mb: float = 0.0
@@ -59,22 +40,18 @@ class PerformanceMetrics:
     
     @property
     def throughput(self) -> float:
-        """Samples per second"""
         if self.total_inference_time > 0:
             return self.total_samples / self.total_inference_time
         return 0.0
     
     @property
     def latency_per_sample_ms(self) -> float:
-        """Average latency per sample in milliseconds"""
         if self.total_samples > 0:
             return (self.total_inference_time / self.total_samples) * 1000
         return 0.0
     
     @property
     def real_time_factor(self) -> float:
-        """Real-time factor (RTF): inference_time / audio_duration
-        RTF < 1 means faster than real-time"""
         if self.total_audio_duration > 0:
             return self.total_inference_time / self.total_audio_duration
         return 0.0
@@ -94,48 +71,33 @@ class PerformanceMetrics:
 
 
 def count_parameters(model: torch.nn.Module) -> Tuple[int, float]:
-    """Count model parameters and estimate size in MB"""
     total_params = sum(p.numel() for p in model.parameters())
-    # Assuming fp16 (2 bytes per parameter)
     size_mb = total_params * 2 / (1024 * 1024)
     return total_params, size_mb
 
 
 def get_gpu_memory_mb() -> float:
-    """Get current GPU memory usage in MB"""
     if torch.cuda.is_available():
         return torch.cuda.max_memory_allocated() / (1024 * 1024)
     return 0.0
 
 
 def reset_gpu_memory_stats():
-    """Reset GPU memory statistics"""
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
 
 def estimate_flops_whisper(model_config, seq_len: int = 448, audio_frames: int = 3000) -> int:
-    """
-    Estimate FLOPs for Whisper model inference.
-    This is a rough estimation based on transformer architecture.
-    
-    FLOPs for transformer:
-    - Self-attention: 4 * seq_len^2 * d_model
-    - FFN: 8 * seq_len * d_model * d_ff
-    - Per layer, per encoder/decoder
-    """
     d_model = model_config.d_model
     encoder_layers = model_config.encoder_layers
     decoder_layers = model_config.decoder_layers
-    d_ff = d_model * 4  # Typical FFN expansion
+    d_ff = d_model * 4
     
-    # Encoder FLOPs (process audio_frames)
     encoder_attention = 4 * audio_frames * audio_frames * d_model * encoder_layers
     encoder_ffn = 8 * audio_frames * d_model * d_ff * encoder_layers
     encoder_flops = encoder_attention + encoder_ffn
     
-    # Decoder FLOPs (generate seq_len tokens, averaged)
-    avg_seq = seq_len // 2  # Average sequence length during generation
+    avg_seq = seq_len // 2
     decoder_self_attention = 4 * avg_seq * avg_seq * d_model * decoder_layers
     decoder_cross_attention = 4 * avg_seq * audio_frames * d_model * decoder_layers
     decoder_ffn = 8 * avg_seq * d_model * d_ff * decoder_layers
@@ -145,7 +107,6 @@ def estimate_flops_whisper(model_config, seq_len: int = 448, audio_frames: int =
 
 
 def format_flops(flops: int) -> str:
-    """Format FLOPs to human readable string"""
     if flops >= 1e12:
         return f"{flops / 1e12:.2f} TFLOPs"
     elif flops >= 1e9:
@@ -155,12 +116,7 @@ def format_flops(flops: int) -> str:
     return f"{flops} FLOPs"
 
 
-# ============================================================
-# Metrics
-# ============================================================
-
 def safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
-    """Safe division avoiding inf/nan"""
     numerator = np.array(numerator)
     denominator = np.array(denominator)
     mask = denominator == 0.0
@@ -170,7 +126,6 @@ def safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
 
 
 def compute_wer(refs: List[str], hyps: List[str]) -> float:
-    """Compute Word Error Rate (for English)"""
     n_words, n_errors = 0, 0
     for ref, hyp in zip(refs, hyps):
         ref_words, hyp_words = ref.split(), hyp.split()
@@ -180,10 +135,8 @@ def compute_wer(refs: List[str], hyps: List[str]) -> float:
 
 
 def compute_cer(refs: List[str], hyps: List[str]) -> float:
-    """Compute Character Error Rate (for Chinese)"""
     n_chars, n_errors = 0, 0
     for ref, hyp in zip(refs, hyps):
-        # Remove spaces for Chinese character-level comparison
         ref_chars = list(ref.replace(" ", ""))
         hyp_chars = list(hyp.replace(" ", ""))
         n_chars += len(ref_chars)
@@ -192,34 +145,22 @@ def compute_cer(refs: List[str], hyps: List[str]) -> float:
 
 
 def normalize_chinese_text(text: str) -> str:
-    """Normalize Chinese text for CER evaluation
-    
-    For Chinese CER calculation:
-    - Remove Whisper special tokens
-    - Remove punctuation (both Chinese and English)
-    - Remove extra whitespace
-    """
-    # Remove Whisper special tokens that might remain
     text = re.sub(r'<\|[^|]+\|>', '', text)
     
-    # Remove Chinese punctuation
     chinese_punc = '，。！？、；：""''【】《》（）—…～·'
     for p in chinese_punc:
         text = text.replace(p, '')
     
-    # Remove English punctuation
     english_punc = ',.!?;:\'"[]{}()<>-_=+/\\|@#$%^&*~`'
     for p in english_punc:
         text = text.replace(p, '')
     
-    # Remove all whitespace
     text = ''.join(text.split())
     
     return text
 
 
 def make_distinct(label_lst: List[Tuple]) -> List[Tuple]:
-    """Make entity labels distinct by adding count"""
     tag2cnt, new_tag_lst = {}, []
     for tag_item in label_lst:
         _ = tag2cnt.setdefault(tag_item, 0)
@@ -230,7 +171,6 @@ def make_distinct(label_lst: List[Tuple]) -> List[Tuple]:
 
 
 def get_ner_scores(all_gt: List, all_predictions: List) -> Dict:
-    """Compute NER scores (precision, recall, F1)"""
     stats = {}
     
     for gt, pred in zip(all_gt, all_predictions):
@@ -257,7 +197,6 @@ def get_ner_scores(all_gt: List, all_predictions: List) -> Dict:
             stats[tag_name]["pred_cnt"].append(len(entities_pred_type))
             stats[tag_name]["gt_cnt"].append(len(entities_true_type))
     
-    # Compute metrics
     metrics = {}
     num_correct, num_gt, num_pred = 0, 0, 0
     
@@ -275,7 +214,6 @@ def get_ner_scores(all_gt: List, all_predictions: List) -> Dict:
         num_pred += pred_cnt
         num_gt += gt_cnt
     
-    # Overall micro
     precision = float(safe_divide(num_correct, num_pred))
     recall = float(safe_divide(num_correct, num_gt))
     fscore = float(safe_divide(2 * precision * recall, precision + recall)) if (precision + recall) > 0 else 0.0
@@ -285,7 +223,6 @@ def get_ner_scores(all_gt: List, all_predictions: List) -> Dict:
 
 
 def compute_sa_accuracy(refs: List[str], hyps: List[str]) -> float:
-    """Compute Sentiment Analysis accuracy"""
     if len(refs) == 0:
         return 0.0
     correct = sum(1 for r, h in zip(refs, hyps) if r.lower() == h.lower())
@@ -293,15 +230,6 @@ def compute_sa_accuracy(refs: List[str], hyps: List[str]) -> float:
 
 
 def compute_sa_metrics(refs: List[str], hyps: List[str]) -> Dict:
-    """Compute comprehensive Sentiment Analysis metrics including F1, Precision, Recall
-    
-    Args:
-        refs: List of reference sentiment labels
-        hyps: List of predicted sentiment labels
-    
-    Returns:
-        Dictionary containing accuracy, macro/micro F1, precision, recall, and per-class metrics
-    """
     if len(refs) == 0:
         return {
             "accuracy": 0.0,
@@ -312,27 +240,21 @@ def compute_sa_metrics(refs: List[str], hyps: List[str]) -> Dict:
             "per_class": {}
         }
     
-    # Normalize labels
     refs_normalized = [r.lower() for r in refs]
     hyps_normalized = [h.lower() for h in hyps]
     
-    # Valid sentiment labels
     valid_labels = ['positive', 'negative', 'neutral']
     
-    # Predictions should already be valid labels (handled in evaluate_sa with penalty)
     hyps_mapped = []
     for h in hyps_normalized:
         if h in valid_labels:
             hyps_mapped.append(h)
         else:
-            # Fallback: if still unknown, map to neutral (shouldn't happen with penalty logic)
             hyps_mapped.append('neutral')
     
-    # Compute accuracy
     correct = sum(1 for r, h in zip(refs_normalized, hyps_mapped) if r == h)
     accuracy = correct / len(refs_normalized) * 100
     
-    # Get classification report
     try:
         report = classification_report(
             refs_normalized, 
@@ -346,7 +268,7 @@ def compute_sa_metrics(refs: List[str], hyps: List[str]) -> Dict:
         macro_f1 = report['macro avg']['f1-score'] * 100
         macro_precision = report['macro avg']['precision'] * 100
         macro_recall = report['macro avg']['recall'] * 100
-        micro_f1 = report['weighted avg']['f1-score'] * 100  # weighted avg approximates micro
+        micro_f1 = report['weighted avg']['f1-score'] * 100
         
         per_class = {
             'Positive': {
@@ -383,12 +305,7 @@ def compute_sa_metrics(refs: List[str], hyps: List[str]) -> Dict:
     }
 
 
-# ============================================================
-# Text Processing
-# ============================================================
-
 def split_asr_and_task(text: str) -> Tuple[str, str]:
-    """Split text into ASR part and task-specific part"""
     delimiter = "[T/L]"
     if delimiter in text:
         parts = text.split(delimiter, 1)
@@ -397,19 +314,6 @@ def split_asr_and_task(text: str) -> Tuple[str, str]:
 
 
 def extract_ner_entities(tagged_text: str, normalize: bool = True, language: str = "en") -> List[Tuple[str, str]]:
-    """Extract NER entities from tagged text
-    
-    Args:
-        tagged_text: Text with NER tags like [PLACE]entity[/PLACE]
-        normalize: Whether to normalize entity text
-        language: Language for normalization ('en' uses EnglishTextNormalizer, 'zh' uses strip only)
-    
-    Returns:
-        List of (tag, entity_text) tuples
-    """
-    # Valid NER tags (exclude SA tags like S)
-    # English: PLACE, QUANT, WHEN, ORG, NORP, PERSON, LAW
-    # Chinese: ORG, PER, LOC
     valid_ner_tags = {'PLACE', 'QUANT', 'WHEN', 'ORG', 'NORP', 'PERSON', 'LAW', 'PER', 'LOC'}
     
     pattern = r'\[([A-Z]+)\](.*?)\[/\1\]'
@@ -418,42 +322,33 @@ def extract_ner_entities(tagged_text: str, normalize: bool = True, language: str
     entities = []
     for tag, phrase in matches:
         if tag in valid_ner_tags:
-            # Normalize entity text based on language
             if normalize:
                 if language == "zh":
-                    phrase = phrase.strip()  # Chinese: just strip whitespace
+                    phrase = phrase.strip()
                 else:
-                    phrase = NORMALIZER(phrase)  # English: use EnglishTextNormalizer
+                    phrase = NORMALIZER(phrase)
             entities.append((tag, phrase))
     
     return entities
 
 
 def extract_sentiment(tagged_text: str) -> Optional[str]:
-    """Extract sentiment label from tagged text"""
     pattern = r'\[S\](\w+)\[/S\]'
     match = re.search(pattern, tagged_text)
     return match.group(1) if match else None
 
 
-# ============================================================
-# Dataset
-# ============================================================
-
 class InferenceDataset(Dataset):
-    """Dataset for inference supporting both NER and SA tasks"""
     
     def __init__(self, file_path: str, root_path: str, processor: WhisperProcessor, task: str = "ner"):
         self.processor = processor
         self.task = task.lower()
         self._resampler_cache = {}
         
-        # Load data
         self.data = pd.read_csv(file_path, sep='\t')
         self.split = self.data['split'][0] + '-wav'
         self.root = os.path.join(root_path, self.split)
         
-        # Process based on task
         if self.task == "ner":
             self._load_ner_data()
         elif self.task == "sa":
@@ -462,19 +357,16 @@ class InferenceDataset(Dataset):
             raise ValueError(f"Unknown task: {task}")
     
     def _load_ner_data(self):
-        """Load NER dataset"""
         self.audio_names = self.data['id'].values.tolist()
         self.texts = self.data['normalized_text'].values.tolist()
         self.ner_labels = self.data['normalized_ner'].values.tolist()
         self.references = self._build_ner_references()
     
     def _load_sa_data(self):
-        """Load SA dataset"""
         audio_names = self.data['id'].values.tolist()
         texts = self.data['normalized_text'].values.tolist()
         sentiments = self.data['sentiment'].values.tolist()
         
-        # Filter out invalid sentiments
         self.audio_names = []
         self.texts = []
         self.sentiments = []
@@ -488,7 +380,6 @@ class InferenceDataset(Dataset):
         self.references = self.sentiments
     
     def _build_ner_references(self) -> List[List[Tuple]]:
-        """Build NER reference entities with text normalization"""
         import ast
         place_tags = ['GPE', 'LOC']
         quant_tags = ['CARDINAL', 'MONEY', 'ORDINAL', 'PERCENT', 'QUANTITY']
@@ -504,7 +395,6 @@ class InferenceDataset(Dataset):
                         tag, start, length = item[0], item[1], item[2]
                         text = self.texts[idx][start:start + length]
                         
-                        # Map to simplified tags
                         if tag in place_tags:
                             mapped_tag = "PLACE"
                         elif tag in quant_tags:
@@ -516,7 +406,6 @@ class InferenceDataset(Dataset):
                         else:
                             continue
                         
-                        # Normalize entity text for consistent matching
                         normalized_text = NORMALIZER(text)
                         entities.append((mapped_tag, normalized_text))
                 except:
@@ -536,11 +425,9 @@ class InferenceDataset(Dataset):
         audio_path = os.path.join(self.root, f"{self.audio_names[idx]}.wav")
         audio, sample_rate = torchaudio.load(audio_path)
         
-        # Handle multi-channel
         if audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
         
-        # Resample if needed
         if sample_rate != 16000:
             audio = self._get_resampler(sample_rate)(audio)
         
@@ -557,7 +444,6 @@ class InferenceDataset(Dataset):
 
 @dataclass
 class InferenceCollator:
-    """Collator for batched inference"""
     processor: Any
     
     def __call__(self, features: List[Dict]) -> Dict:
@@ -572,13 +458,11 @@ class InferenceCollator:
 
 
 class ChineseNERInferenceDataset(Dataset):
-    """Chinese NER dataset for inference (AISHELL-NER format)"""
     
     def __init__(self, file_path: str, processor: WhisperProcessor):
         self.processor = processor
         self._resampler_cache = {}
         
-        # Load JSONL data
         self.samples = []
         import json
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -603,18 +487,15 @@ class ChineseNERInferenceDataset(Dataset):
         sentence = sample['sentence']
         entities = sample.get('entity', [])
         
-        # Build reference entities (sorted by position, NER types: ORG, PER, LOC)
-        # For Chinese, just strip whitespace (matching extract_ner_entities behavior)
         ref_entities = []
         sorted_entities = sorted(entities, key=lambda x: x[0]) if entities else []
         for entity in sorted_entities:
-            entity_text = entity[2].strip()  # Strip whitespace for consistent matching
+            entity_text = entity[2].strip()
             entity_type = entity[3]
             if entity_type in ['ORG', 'PER', 'LOC']:
                 ref_entities.append((entity_type, entity_text))
         ref_entities = make_distinct(ref_entities)
         
-        # Load audio
         audio, sample_rate = torchaudio.load(audio_path)
         if audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
@@ -634,7 +515,6 @@ class ChineseNERInferenceDataset(Dataset):
 
 
 class ChineseSAInferenceDataset(Dataset):
-    """Chinese SA dataset for inference (CH-SIMS format)"""
     
     VALID_SENTIMENTS = {'Positive', 'Negative', 'Neutral'}
     
@@ -642,7 +522,6 @@ class ChineseSAInferenceDataset(Dataset):
         self.processor = processor
         self._resampler_cache = {}
         
-        # Load CSV data
         df = pd.read_csv(file_path)
         self.samples = []
         
@@ -670,7 +549,6 @@ class ChineseSAInferenceDataset(Dataset):
         sample = self.samples[idx]
         audio_path = sample['path']
         
-        # Load audio
         audio, sample_rate = torchaudio.load(audio_path)
         if audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
@@ -689,12 +567,7 @@ class ChineseSAInferenceDataset(Dataset):
         }
 
 
-# ============================================================
-# Inference Engine
-# ============================================================
-
 class InferenceEngine:
-    """High-performance inference engine for UniSLU with performance tracking"""
     
     def __init__(
         self,
@@ -710,11 +583,9 @@ class InferenceEngine:
         self.beam_size = beam_size
         self.language = language
         
-        # Map language code
         lang_map = {"en": "english", "zh": "chinese"}
         whisper_language = lang_map.get(language, language)
         
-        # Load processor (feature_extractor from base model, tokenizer from checkpoint)
         logger.info(f"Loading processor from {processor_path}")
         logger.info(f"Loading tokenizer from {model_path} (language={whisper_language})")
         
@@ -722,32 +593,28 @@ class InferenceEngine:
         tokenizer = WhisperTokenizer.from_pretrained(model_path, language=whisper_language, task="transcribe")
         self.processor = WhisperProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
         
-        # Load model with optimizations
         logger.info(f"Loading model from {model_path}")
         if use_dynamic_decoder:
             self.model = DynamicDecodeWhisper.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16,  # Use fp16 for faster inference
+                torch_dtype=torch.float16,
             )
             self.model.set_task_delimiter_id(self.processor.tokenizer)
         else:
             self.model = WhisperForConditionalGeneration.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16,  # Use fp16 for faster inference
+                torch_dtype=torch.float16,
             )
         
         self.model.resize_token_embeddings(len(self.processor.tokenizer))
         self.model.to(self.device)
         self.model.eval()
         
-        # Disable gradient computation globally for inference
         torch.set_grad_enabled(False)
         
-        # Get task token IDs
         self.ner_token_id = self.processor.tokenizer.convert_tokens_to_ids(["[NER]"])[0]
         self.sa_token_id = self.processor.tokenizer.convert_tokens_to_ids(["[SA]"])[0]
         
-        # Model statistics
         self.model_params, self.model_size_mb = count_parameters(self.model)
         self.estimated_flops = estimate_flops_whisper(self.model.config)
         
@@ -758,45 +625,35 @@ class InferenceEngine:
     
     @torch.no_grad()
     def inference_batch(self, batch: Dict, task: str = "ner") -> Tuple[List[str], float]:
-        """Batch inference using generate()
-        
-        Returns:
-            Tuple of (transcriptions, inference_time_seconds)
-        """
         input_features = batch["input_features"].to(self.device, dtype=torch.float16)
         
-        # Synchronize GPU before timing
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         
         start_time = time.perf_counter()
         
-        # Generate with correct language setting
         generated_ids = self.model.generate(
             input_features,
             max_new_tokens=256,
             num_beams=self.beam_size,
-            language=self.language,  # Use configured language (en/zh)
+            language=self.language,
             task="transcribe",
             use_cache=True,
             return_timestamps=False,
         )
         
-        # Synchronize GPU after generation
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         
         inference_time = time.perf_counter() - start_time
         
-        # Decode - keep special tokens to see NER/SA tags
         transcriptions = self.processor.batch_decode(generated_ids, skip_special_tokens=False)
         
-        # Clean up transcriptions (remove start tokens but keep task tokens)
         cleaned = []
         for t in transcriptions:
             t = t.replace("<|startoftranscript|>", "")
             t = t.replace("<|en|>", "")
-            t = t.replace("<|zh|>", "")  # Remove Chinese language token
+            t = t.replace("<|zh|>", "")
             t = t.replace("<|transcribe|>", "")
             t = t.replace("<|notimestamps|>", "")
             t = t.replace("<|endoftext|>", "")
@@ -806,7 +663,6 @@ class InferenceEngine:
     
     @torch.no_grad()
     def inference_single_dynamic(self, feature: np.ndarray, task: str = "ner") -> str:
-        """Single sample inference using custom beam search decoder"""
         task_id = self.ner_token_id if task == "ner" else self.sa_token_id
         
         hyps = self.model.dynamic_decoder(
@@ -820,10 +676,6 @@ class InferenceEngine:
         return transcription
 
 
-# ============================================================
-# Evaluation
-# ============================================================
-
 def evaluate_ner(
     engine: InferenceEngine,
     dataset: InferenceDataset,
@@ -831,7 +683,6 @@ def evaluate_ner(
     output_file: Optional[str] = None,
     language: str = "en",
 ) -> Tuple[Dict, PerformanceMetrics]:
-    """Evaluate NER task with performance metrics"""
     logger.info(f"Evaluating NER on {len(dataset)} samples")
     
     dataloader = DataLoader(
@@ -843,7 +694,6 @@ def evaluate_ner(
         pin_memory=True,
     )
     
-    # Initialize performance tracking
     perf_metrics = PerformanceMetrics()
     perf_metrics.model_parameters = engine.model_params
     perf_metrics.model_size_mb = engine.model_size_mb
@@ -855,34 +705,27 @@ def evaluate_ner(
     all_ref_texts = []
     all_pred_texts = []
     
-    # Warmup run (first batch may be slower due to CUDA initialization)
     warmup_done = False
     
     for batch in tqdm(dataloader, desc="NER Inference"):
         transcriptions, batch_time = engine.inference_batch(batch, task="ner")
         
-        # Skip first batch for timing (warmup)
         if warmup_done:
             perf_metrics.batch_times.append(batch_time)
             perf_metrics.total_inference_time += batch_time
             perf_metrics.total_samples += len(transcriptions)
         else:
             warmup_done = True
-            # Still count samples but note it's warmup
             perf_metrics.total_samples += len(transcriptions)
             perf_metrics.total_inference_time += batch_time
         
-        # Estimate audio duration (30 seconds per sample is Whisper's max)
-        # Actual duration would need to be computed from audio files
-        perf_metrics.total_audio_duration += len(transcriptions) * 10  # Assume 10s avg
+        perf_metrics.total_audio_duration += len(transcriptions) * 10
         
         for i, transcription in enumerate(transcriptions):
             audio_id = batch["audio_ids"][i]
             ref_text = batch["reference_texts"][i]
             ref_entities = batch["references"][i]
             
-            # Parse prediction
-            # Note: No need to reverse - data preprocessing already converts to correct order
             pred_asr, pred_task = split_asr_and_task(transcription)
             pred_entities = extract_ner_entities(pred_task, normalize=True, language=language)
             pred_entities_distinct = make_distinct(pred_entities)
@@ -896,7 +739,6 @@ def evaluate_ner(
                 "full_prediction": transcription,
             })
             
-            # Normalize text for error rate computation
             if language == "zh":
                 all_ref_texts.append(normalize_chinese_text(ref_text))
                 all_pred_texts.append(normalize_chinese_text(pred_asr))
@@ -906,10 +748,8 @@ def evaluate_ner(
             all_ref_entities.append(ref_entities if ref_entities else [])
             all_pred_entities.append(pred_entities_distinct)
     
-    # Record peak GPU memory
     perf_metrics.peak_gpu_memory_mb = get_gpu_memory_mb()
     
-    # Compute metrics - use CER for Chinese, WER for English
     if language == "zh":
         error_rate = compute_cer(all_ref_texts, all_pred_texts)
         error_rate_name = "cer"
@@ -927,7 +767,6 @@ def evaluate_ner(
         "per_tag_scores": {k: v for k, v in ner_scores.items() if k != "overall_micro"},
     }
     
-    # Save results
     if output_file:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         output_data = {
@@ -950,7 +789,6 @@ def evaluate_sa(
     output_file: Optional[str] = None,
     language: str = "en",
 ) -> Tuple[Dict, PerformanceMetrics]:
-    """Evaluate Sentiment Analysis task with performance metrics"""
     logger.info(f"Evaluating SA on {len(dataset)} samples")
     
     dataloader = DataLoader(
@@ -962,7 +800,6 @@ def evaluate_sa(
         pin_memory=True,
     )
     
-    # Initialize performance tracking
     perf_metrics = PerformanceMetrics()
     perf_metrics.model_parameters = engine.model_params
     perf_metrics.model_size_mb = engine.model_size_mb
@@ -974,13 +811,11 @@ def evaluate_sa(
     all_ref_sentiments = []
     all_pred_sentiments = []
     
-    # Warmup run
     warmup_done = False
     
     for batch in tqdm(dataloader, desc="SA Inference"):
         transcriptions, batch_time = engine.inference_batch(batch, task="sa")
         
-        # Skip first batch for timing (warmup)
         if warmup_done:
             perf_metrics.batch_times.append(batch_time)
             perf_metrics.total_inference_time += batch_time
@@ -990,21 +825,17 @@ def evaluate_sa(
             perf_metrics.total_samples += len(transcriptions)
             perf_metrics.total_inference_time += batch_time
         
-        # Estimate audio duration
-        perf_metrics.total_audio_duration += len(transcriptions) * 10  # Assume 10s avg
+        perf_metrics.total_audio_duration += len(transcriptions) * 10
         
         for i, transcription in enumerate(transcriptions):
             audio_id = batch["audio_ids"][i]
             ref_text = batch["reference_texts"][i]
             ref_sentiment = batch["references"][i]
             
-            # Parse prediction
             pred_asr, pred_task = split_asr_and_task(transcription)
             pred_sentiment_raw = extract_sentiment(pred_task)
             
-            # Handle empty predictions: assign wrong label as penalty (matching reference script)
             if pred_sentiment_raw is None:
-                # Penalty: assign a deliberately wrong label
                 if ref_sentiment == "Neutral":
                     pred_sentiment = "Positive"
                 elif ref_sentiment == "Negative":
@@ -1025,7 +856,6 @@ def evaluate_sa(
                 "full_prediction": transcription,
             })
             
-            # Normalize text for error rate computation
             if language == "zh":
                 all_ref_texts.append(normalize_chinese_text(ref_text))
                 all_pred_texts.append(normalize_chinese_text(pred_asr))
@@ -1035,10 +865,8 @@ def evaluate_sa(
             all_ref_sentiments.append(ref_sentiment if ref_sentiment else "Unknown")
             all_pred_sentiments.append(pred_sentiment)
     
-    # Record peak GPU memory
     perf_metrics.peak_gpu_memory_mb = get_gpu_memory_mb()
     
-    # Compute metrics - use CER for Chinese, WER for English
     if language == "zh":
         error_rate = compute_cer(all_ref_texts, all_pred_texts)
         error_rate_name = "cer"
@@ -1058,7 +886,6 @@ def evaluate_sa(
         "sa_per_class": sa_metrics["per_class"],
     }
     
-    # Save results
     if output_file:
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         output_data = {
@@ -1074,47 +901,32 @@ def evaluate_sa(
     return metrics, perf_metrics
 
 
-# ============================================================
-# Main
-# ============================================================
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="UniSLU Inference and Evaluation")
+    parser = argparse.ArgumentParser()
     
-    # Model paths
-    parser.add_argument("--model_path", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--processor_path", type=str, default=None, help="Path to processor (default: same as model)")
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--processor_path", type=str, default=None)
     
-    # Language and dataset type
-    parser.add_argument("--language", type=str, default="en", choices=["en", "zh"],
-                       help="Language: 'en' (English, use WER) or 'zh' (Chinese, use CER)")
-    parser.add_argument("--ner_dataset", type=str, default="slue",
-                       help="NER dataset type: 'slue' (English) or 'aishell' (Chinese)")
-    parser.add_argument("--sa_dataset", type=str, default="slue",
-                       help="SA dataset type: 'slue' (English) or 'ch-sims' (Chinese)")
+    parser.add_argument("--language", type=str, default="en", choices=["en", "zh"])
+    parser.add_argument("--ner_dataset", type=str, default="slue")
+    parser.add_argument("--sa_dataset", type=str, default="slue")
     
-    # Data paths (use 'none' to disable a task)
-    parser.add_argument("--ner_data_path", type=str, default=None, 
-                       help="Path to NER test file (TSV for slue, JSONL for aishell, 'none' to disable)")
-    parser.add_argument("--ner_audio_root", type=str, default=None, help="Root path for NER audio files")
-    parser.add_argument("--sa_data_path", type=str, default=None, 
-                       help="Path to SA test file (TSV for slue, CSV for ch-sims, 'none' to disable)")
-    parser.add_argument("--sa_audio_root", type=str, default=None, help="Root path for SA audio files")
+    parser.add_argument("--ner_data_path", type=str, default=None)
+    parser.add_argument("--ner_audio_root", type=str, default=None)
+    parser.add_argument("--sa_data_path", type=str, default=None)
+    parser.add_argument("--sa_audio_root", type=str, default=None)
     
-    # Inference settings
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for inference")
-    parser.add_argument("--beam_size", type=int, default=5, help="Beam size for decoding")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
-    parser.add_argument("--use_dynamic_decoder", action="store_true", help="Use custom beam search decoder")
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--beam_size", type=int, default=5)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--use_dynamic_decoder", action="store_true")
     
-    # Output
-    parser.add_argument("--output_dir", type=str, default="./inference_results", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="./inference_results")
     
     return parser.parse_args()
 
 
 def log_performance_metrics(perf: PerformanceMetrics, task_name: str):
-    """Log performance metrics"""
     logger.info(f"{task_name} Performance Metrics:")
     logger.info(f"  Total samples: {perf.total_samples}")
     logger.info(f"  Total inference time: {perf.total_inference_time:.2f}s")
@@ -1127,31 +939,10 @@ def log_performance_metrics(perf: PerformanceMetrics, task_name: str):
 
 
 def build_output_path(output_dir: str, model_path: str) -> str:
-    """Build output path based on model checkpoint path
-    
-    Args:
-        output_dir: Base output directory (e.g., ./inference_results)
-        model_path: Path to model checkpoint (e.g., model-output/test-new-code/checkpoint-2100)
-    
-    Returns:
-        Full output path (e.g., ./inference_results/test-new-code/checkpoint-2100-res)
-    
-    Example:
-        model_path = "model-output/test-new-code/checkpoint-2100"
-        output_dir = "./inference_results"
-        result = "./inference_results/test-new-code/checkpoint-2100-res"
-    """
-    # Normalize path (remove trailing slashes)
     model_path = model_path.rstrip('/')
     
-    # Split path into parts
     path_parts = model_path.split('/')
     
-    # Find the index after "model-output" or similar base directory
-    # We want to extract: sub-directory/checkpoint-xxx
-    # Common patterns: model-output/xxx/checkpoint-xxx, /path/to/model-output/xxx/checkpoint-xxx
-    
-    # Try to find "model-output" or similar marker
     base_markers = ['model-output', 'models', 'checkpoints', 'output']
     start_idx = 0
     
@@ -1160,18 +951,14 @@ def build_output_path(output_dir: str, model_path: str) -> str:
             start_idx = i + 1
             break
     
-    # If no marker found, use last 2 parts (sub-dir/checkpoint)
     if start_idx == 0 and len(path_parts) >= 2:
         start_idx = len(path_parts) - 2
     elif start_idx == 0:
         start_idx = len(path_parts) - 1
     
-    # Extract sub-path
     sub_parts = path_parts[start_idx:]
     
-    # Build result path: sub-dir/checkpoint-xxx-res
     if sub_parts:
-        # Last part is the checkpoint name, add "-res" suffix
         sub_parts[-1] = sub_parts[-1] + "-res"
         result_subpath = '/'.join(sub_parts)
     else:
@@ -1185,10 +972,8 @@ def main():
     
     setup_logging()
     
-    # Use model path as processor path if not specified
     processor_path = args.processor_path or args.model_path
     
-    # Initialize engine
     engine = InferenceEngine(
         model_path=args.model_path,
         processor_path=processor_path,
@@ -1198,26 +983,22 @@ def main():
         language=args.language,
     )
     
-    # Build output directory based on checkpoint path
-    # e.g., model-output/test-new-code/checkpoint-2100 -> ./inference_results/test-new-code/checkpoint-2100-res
     result_dir = build_output_path(args.output_dir, args.model_path)
     os.makedirs(result_dir, exist_ok=True)
     logger.info(f"Results will be saved to: {result_dir}")
     
-    # Evaluate NER
     ner_path = args.ner_data_path
     if ner_path and ner_path.lower() != 'none':
         logger.info("=" * 60)
         logger.info(f"Evaluating NER Task ({args.ner_dataset})")
         logger.info("=" * 60)
         
-        # Load dataset based on type
         if args.ner_dataset == "aishell":
             ner_dataset = ChineseNERInferenceDataset(
                 args.ner_data_path,
                 engine.processor,
             )
-        else:  # slue
+        else:
             ner_dataset = InferenceDataset(
                 args.ner_data_path,
                 args.ner_audio_root,
@@ -1233,7 +1014,6 @@ def main():
             language=args.language,
         )
         
-        # Log results (use CER for Chinese, WER for English)
         error_rate_name = "CER" if args.language == "zh" else "WER"
         error_rate_key = "cer" if args.language == "zh" else "wer"
         logger.info(f"NER Results:")
@@ -1244,20 +1024,18 @@ def main():
         logger.info("-" * 40)
         log_performance_metrics(ner_perf, "NER")
     
-    # Evaluate SA
     sa_path = args.sa_data_path
     if sa_path and sa_path.lower() != 'none':
         logger.info("=" * 60)
         logger.info(f"Evaluating SA Task ({args.sa_dataset})")
         logger.info("=" * 60)
         
-        # Load dataset based on type
         if args.sa_dataset == "ch-sims":
             sa_dataset = ChineseSAInferenceDataset(
                 args.sa_data_path,
                 engine.processor,
             )
-        else:  # slue
+        else:
             sa_dataset = InferenceDataset(
                 args.sa_data_path,
                 args.sa_audio_root,
@@ -1273,7 +1051,6 @@ def main():
             language=args.language,
         )
         
-        # Log results (use CER for Chinese, WER for English)
         error_rate_name = "CER" if args.language == "zh" else "WER"
         error_rate_key = "cer" if args.language == "zh" else "wer"
         logger.info(f"SA Results:")
@@ -1296,4 +1073,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
